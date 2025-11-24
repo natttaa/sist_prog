@@ -3,6 +3,7 @@
 #include <winsock2.h>
 #include <stdio.h>
 #include <vector>
+#include <time.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -13,8 +14,10 @@ HANDLE stop_evt;
 LONG run_flag = 1;
 SOCKET listen_s = INVALID_SOCKET;
 CRITICAL_SECTION cs;
+HANDLE monitor_thread = NULL;
 
 #define MAX_SESS 16
+#define LOG_FILE "C:\\RemoteConsole\\service.log"
 
 struct ClientSess {
     SOCKET sock;
@@ -25,9 +28,24 @@ struct ClientSess {
     HANDLE thread1;
     HANDLE thread2;
     LONG active;
+    DWORD thread1_id;
+    DWORD thread2_id;
+    time_t start_time;
 };
 
 std::vector<ClientSess*> clients;
+
+void WriteLog(const char* msg) {
+    FILE* f = fopen(LOG_FILE, "a");
+    if (f) {
+        time_t now = time(NULL);
+        char timebuf[64];
+        struct tm* tm_info = localtime(&now);
+        strftime(timebuf, 64, "%Y-%m-%d %H:%M:%S", tm_info);
+        fprintf(f, "[%s] %s\n", timebuf, msg);
+        fclose(f);
+    }
+}
 
 void SetStatus(DWORD state, DWORD code, DWORD wait) {
     static DWORD checkpoint = 1;
@@ -52,6 +70,7 @@ void SetStatus(DWORD state, DWORD code, DWORD wait) {
 
 VOID WINAPI ServiceCtrl(DWORD ctrl) {
     if (ctrl == SERVICE_CONTROL_STOP) {
+        WriteLog("Service stop requested");
         SetStatus(SERVICE_STOP_PENDING, NO_ERROR, 0);
         InterlockedExchange(&run_flag, 0);
         SetEvent(stop_evt);
@@ -114,6 +133,11 @@ DWORD WINAPI RecvThread(LPVOID arg) {
             }
         }
     }
+
+    char logmsg[256];
+    sprintf(logmsg, "RecvThread (ID:%d) exited", GetCurrentThreadId());
+    WriteLog(logmsg);
+
     return 0;
 }
 
@@ -148,11 +172,20 @@ DWORD WINAPI SendThread(LPVOID arg) {
                 break;
         }
     }
+
+    char logmsg[256];
+    sprintf(logmsg, "SendThread (ID:%d) exited", GetCurrentThreadId());
+    WriteLog(logmsg);
+
     return 0;
 }
 
 void CleanupSession(ClientSess* s) {
     if (!s) return;
+
+    char logmsg[256];
+    sprintf(logmsg, "Cleaning up session (threads: %d, %d)", s->thread1_id, s->thread2_id);
+    WriteLog(logmsg);
 
     InterlockedExchange(&s->active, 0);
 
@@ -188,7 +221,79 @@ void CleanupSession(ClientSess* s) {
     delete s;
 }
 
+DWORD WINAPI MonitorThread(LPVOID arg) {
+    WriteLog("Monitor thread started");
+
+    while (InterlockedCompareExchange(&run_flag, 0, 0)) {
+        if (WaitForSingleObject(stop_evt, 0) == WAIT_OBJECT_0) {
+            break;
+        }
+
+        EnterCriticalSection(&cs);
+
+        for (size_t i = 0; i < clients.size(); ) {
+            ClientSess* sess = clients[i];
+
+            if (!sess || !InterlockedCompareExchange(&sess->active, 0, 0)) {
+                i++;
+                continue;
+            }
+
+            DWORD exit_code1 = STILL_ACTIVE;
+            DWORD exit_code2 = STILL_ACTIVE;
+
+            if (sess->thread1) {
+                GetExitCodeThread(sess->thread1, &exit_code1);
+            }
+
+            if (sess->thread2) {
+                GetExitCodeThread(sess->thread2, &exit_code2);
+            }
+
+            bool t1_dead = (exit_code1 != STILL_ACTIVE);
+            bool t2_dead = (exit_code2 != STILL_ACTIVE);
+
+            if (t1_dead || t2_dead) {
+                char logmsg[256];
+                time_t now = time(NULL);
+                time_t uptime = now - sess->start_time;
+
+                sprintf(logmsg, "UNEXPECTED THREAD DEATH detected! Thread1:%s Thread2:%s (uptime: %d sec)",
+                    t1_dead ? "DEAD" : "alive",
+                    t2_dead ? "DEAD" : "alive",
+                    (int)uptime);
+                WriteLog(logmsg);
+
+                InterlockedExchange(&sess->active, 0);
+
+                if (sess->sock != INVALID_SOCKET) {
+                    closesocket(sess->sock);
+                    sess->sock = INVALID_SOCKET;
+                }
+
+                CleanupSession(sess);
+
+                clients.erase(clients.begin() + i);
+
+                WriteLog("Dead session removed from list");
+                continue;
+            }
+
+            i++;
+        }
+
+        LeaveCriticalSection(&cs);
+
+        Sleep(2000);
+    }
+
+    WriteLog("Monitor thread exiting");
+    return 0;
+}
+
 VOID WINAPI SvcMain(DWORD argc, LPSTR* argv) {
+    WriteLog("Service starting");
+
     svc_handle = RegisterServiceCtrlHandlerA("RemoteConsoleSvc", ServiceCtrl);
     if (!svc_handle) return;
 
@@ -233,6 +338,9 @@ VOID WINAPI SvcMain(DWORD argc, LPSTR* argv) {
     u_long mode = 1;
     ioctlsocket(listen_s, FIONBIO, &mode);
 
+    monitor_thread = CreateThread(NULL, 0, MonitorThread, NULL, 0, NULL);
+    WriteLog("Monitor thread created");
+
     while (InterlockedCompareExchange(&run_flag, 0, 0)) {
         if (WaitForSingleObject(stop_evt, 0) == WAIT_OBJECT_0)
             break;
@@ -260,6 +368,8 @@ VOID WINAPI SvcMain(DWORD argc, LPSTR* argv) {
                 continue;
             }
 
+            WriteLog("New client connected");
+
             EnterCriticalSection(&cs);
             int cnt = clients.size();
             if (cnt >= MAX_SESS) {
@@ -268,6 +378,7 @@ VOID WINAPI SvcMain(DWORD argc, LPSTR* argv) {
                 send(new_s, msg, strlen(msg), 0);
                 shutdown(new_s, SD_BOTH);
                 closesocket(new_s);
+                WriteLog("Client rejected - server full");
                 continue;
             }
             LeaveCriticalSection(&cs);
@@ -313,6 +424,7 @@ VOID WINAPI SvcMain(DWORD argc, LPSTR* argv) {
                 CloseHandle(out_r);
                 CloseHandle(out_w);
                 closesocket(new_s);
+                WriteLog("Failed to create cmd.exe process");
                 continue;
             }
 
@@ -325,13 +437,18 @@ VOID WINAPI SvcMain(DWORD argc, LPSTR* argv) {
             sess->proc_t = pi.hThread;
             sess->pipe_w = in_w;
             sess->pipe_r = out_r;
+            sess->start_time = time(NULL);
             InterlockedExchange(&sess->active, 1);
 
             u_long sock_mode = 1;
             ioctlsocket(new_s, FIONBIO, &sock_mode);
 
-            sess->thread1 = CreateThread(NULL, 0, RecvThread, sess, 0, NULL);
-            sess->thread2 = CreateThread(NULL, 0, SendThread, sess, 0, NULL);
+            sess->thread1 = CreateThread(NULL, 0, RecvThread, sess, 0, &sess->thread1_id);
+            sess->thread2 = CreateThread(NULL, 0, SendThread, sess, 0, &sess->thread2_id);
+
+            char logmsg[256];
+            sprintf(logmsg, "Session created (threads: %d, %d)", sess->thread1_id, sess->thread2_id);
+            WriteLog(logmsg);
 
             EnterCriticalSection(&cs);
             clients.push_back(sess);
@@ -340,6 +457,12 @@ VOID WINAPI SvcMain(DWORD argc, LPSTR* argv) {
     }
 
     InterlockedExchange(&run_flag, 0);
+
+    if (monitor_thread) {
+        WaitForSingleObject(monitor_thread, 5000);
+        CloseHandle(monitor_thread);
+        WriteLog("Monitor thread stopped");
+    }
 
     if (listen_s != INVALID_SOCKET) {
         shutdown(listen_s, SD_BOTH);
@@ -376,6 +499,7 @@ cleanup:
     CloseHandle(stop_evt);
     DeleteCriticalSection(&cs);
 
+    WriteLog("Service stopped");
     SetStatus(SERVICE_STOPPED, NO_ERROR, 0);
 }
 
